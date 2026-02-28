@@ -2,6 +2,9 @@ name: WindowsMacOS
 
 on:
   workflow_call:
+  schedule:
+  # Daily at 00:34 UTC
+    - cron: 34 0 * * *
 
 permissions:
   contents: read
@@ -78,7 +81,8 @@ jobs:
 
     env:
       BUILD_DIR: ${{ github.workspace }}/build
-      CCACHE_DIR: ${{ github.workspace }}/build/ccache
+      SCCACHE_DIR: ${{ github.workspace }}/.sccache
+      RUSTC_WRAPPER: "sccache"
 
     steps:
     - name: Check out code
@@ -159,13 +163,13 @@ jobs:
 
     - name: Install specific QEMU from Choco
       if: ${{ runner.os == 'Windows' }}
-      uses: crazy-max/ghaction-chocolatey@v3
+      uses: crazy-max/ghaction-chocolatey@v4
       with:
         args: install --yes qemu --version=2023.4.24
 
     - name: Install other packages from Choco
       if: ${{ runner.os == 'Windows' }}
-      uses: crazy-max/ghaction-chocolatey@v3
+      uses: crazy-max/ghaction-chocolatey@v4
       with:
         args: install --yes wget unzip
 
@@ -222,36 +226,36 @@ jobs:
           sudo chmod +x /opt/homebrew/bin/nuget
         fi
 
-    - name: Set up CCache
-      if: ${{ runner.os == 'macOS' }}
-      id: setup-ccache
+    - name: Determine cache key
+      id: cache-key
+      shell: bash
       run: |
-        brew install ccache
-
         # Find common base between main and HEAD to use as cache key.
-        # This avoids PRs from publishing caches.
         git -c protocol.version=2 fetch --no-tags --prune --progress --no-recurse-submodules origin main
         echo "cache-key=$( git merge-base origin/main ${{ github.sha }} )" >> $GITHUB_OUTPUT
-        echo "$( brew --prefix ccache )/libexec" >> ${GITHUB_PATH}
 
-    - name: CCache
-      if: ${{ runner.os == 'macOS' }}
-      uses: actions/cache@v5
+    - name: Restore sccache
+      uses: actions/cache/restore@v5
       with:
-        key: "ccache-${{ matrix.runs-on }}-${{ steps.setup-ccache.outputs.cache-key }}"
-        restore-keys: |
-          ccache-${{ matrix.runs-on }}
-        path: ${{ env.CCACHE_DIR }}
+        path: ${{ env.SCCACHE_DIR }}
+        key: "sccache-${{ matrix.runs-on }}-${{ steps.cache-key.outputs.cache-key }}"
+        restore-keys: sccache-${{ matrix.runs-on }}
+
+    - name: Run sccache-cache
+      uses: mozilla-actions/sccache-action@v0.0.9
+      continue-on-error: true
+      with:
+        version: "v0.12.0"
 
     - name: Install Windows ADK
       if: ${{ runner.os == 'Windows' }}
-      uses: crazy-max/ghaction-chocolatey@v3
+      uses: crazy-max/ghaction-chocolatey@v4
       with:
         args: install --yes windows-adk-deploy
 
     - name: Install cmake
       if: ${{ runner.os == 'Windows' }}
-      uses: lukka/get-cmake@v4.2.1
+      uses: lukka/get-cmake@v4.2.3
 
     - name: Set up MSVC
       if: ${{ runner.os == 'Windows' }}
@@ -266,14 +270,11 @@ jobs:
         -DMULTIPASS_UPSTREAM=origin
         -DMULTIPASS_BUILD_LABEL=${{ steps.build-params.outputs.label }}
         ${{ runner.os == 'Windows' && '-DCMAKE_C_COMPILER=cl.exe -DCMAKE_CXX_COMPILER=cl.exe' || '' }}
+        ${{ github.event_name == 'schedule' && '-DMP_ALLOW_OPTIONAL_FEATURES=OFF' || '' }}
         ${{ github.workspace }}
 
     - name: Build
       run: cmake --build ${{ env.BUILD_DIR }}
-
-    - name: Clear CCache stats
-      if: ${{ runner.os == 'macOS' }}
-      run: ccache --show-stats --zero-stats
 
     - name: Test
       working-directory: ${{ env.BUILD_DIR }}
@@ -337,6 +338,13 @@ jobs:
 
         echo "$ARTIFACT_NAME" >> "$GITHUB_OUTPUT"
         echo "$FILE_NAME" >> "$GITHUB_OUTPUT"
+
+    - name: Save sccache
+      uses: actions/cache/save@v5
+      if: ${{ github.ref == 'refs/heads/main' }}
+      with:
+        path: ${{ env.SCCACHE_DIR }}
+        key: "sccache-${{ matrix.runs-on }}-${{ steps.cache-key.outputs.cache-key }}"
 
   CombineAndPublishMacOSPackage:
     # Want to run even if one of the builds above failed
@@ -431,3 +439,21 @@ jobs:
           ${{ needs.BuildAndTest.outputs.mac-x86-package-artifact-name }}
           ${{ needs.BuildAndTest.outputs.mac-arm-package-artifact-name }}
         failOnError: false
+
+  Report-Workflow-Failure:
+    needs: [BuildAndTest, CombineAndPublishMacOSPackage]
+    if: ${{ !cancelled() && !success() && github.event_name == 'schedule' }}
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Report workflow failure
+      uses: mattermost/action-mattermost-notify@master
+      with:
+        MATTERMOST_WEBHOOK_URL: ${{ secrets.MATTERMOST_WEBHOOK_URL }}
+        MATTERMOST_CHANNEL: multipass
+        TEXT: |
+          :red_circle: @mp
+          Scheduled [WindowsMacOS](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) workflow exited before completing.
+        MATTERMOST_USERNAME: ${{ github.triggering_actor }}
+        MATTERMOST_ICON_URL: https://www.flaticon.com/free-icon/github-logo_25231

@@ -18,6 +18,7 @@
 #pragma once
 
 #include "singleton.h"
+#include "utils/sorted_map_view.h"
 
 #include <multipass/network_interface.h>
 
@@ -47,16 +48,17 @@ public:
     virtual QJsonValue update_cloud_init_instance_id(const QJsonValue& id,
                                                      const std::string& src_vm_name,
                                                      const std::string& dest_vm_name) const;
-    virtual QJsonValue update_unique_identifiers_of_metadata(const QJsonValue& metadata,
-                                                             const multipass::VMSpecs& src_specs,
-                                                             const multipass::VMSpecs& dest_specs,
-                                                             const std::string& src_vm_name,
-                                                             const std::string& dest_vm_name) const;
     virtual QJsonArray extra_interfaces_to_json_array(
         const std::vector<NetworkInterface>& extra_interfaces) const;
     virtual std::optional<std::vector<NetworkInterface>> read_extra_interfaces(
         const QJsonObject& record) const;
 };
+
+boost::json::object update_unique_identifiers_of_metadata(const boost::json::object& metadata,
+                                                          const multipass::VMSpecs& src_specs,
+                                                          const multipass::VMSpecs& dest_specs,
+                                                          const std::string& src_vm_name,
+                                                          const std::string& dest_vm_name);
 
 namespace detail
 {
@@ -123,6 +125,22 @@ T tag_invoke(const boost::json::value_to_tag<T>&,
         result.emplace(key, value_to<typename T::mapped_type>(elem));
     }
     return result;
+}
+
+struct SortJsonKeys
+{
+};
+
+template <typename T>
+    requires boost::json::is_map_like<T>::value
+void tag_invoke(const boost::json::value_from_tag&,
+                boost::json::value& json,
+                const T& mapping,
+                const SortJsonKeys&)
+{
+    auto& obj = json.emplace_object();
+    for (const auto& [key, value] : sorted_map_view(mapping))
+        obj.emplace(key.get(), boost::json::value_from(value.get()));
 }
 
 struct PrettyPrintOptions

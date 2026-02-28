@@ -15,12 +15,12 @@
 cmake_minimum_required(VERSION 3.25)
 cmake_policy(SET CMP0079 NEW) # Allow target_link_libraries() in subdirs
 
+include(feature-flags.cmake)
 include(src/cmake/environment-utils.cmake)
 is_running_in_ci(IS_RUNNING_IN_CI)
 
 option(VCPKG_BUILD_DEFAULT "Enable or disable building the default vcpkg triplet, which includes both debug and release variants." OFF)
 option(MULTIPASS_ENABLE_TESTS "Build tests" ON)
-option(MULTIPASS_ENABLE_FLUTTER_GUI "Build Flutter GUI" ON)
 
 message(STATUS "Running in CI environment? ${IS_RUNNING_IN_CI}")
 
@@ -34,6 +34,10 @@ cmake_host_system_information(RESULT HOST_ARCH QUERY OS_PLATFORM)
 
 if ("${HOST_ARCH}" STREQUAL "arm64" OR "${HOST_ARCH}" STREQUAL "aarch64")
   set(VCPKG_HOST_ARCH "arm64")
+elseif ("${HOST_ARCH}" STREQUAL "s390x")
+  set(VCPKG_HOST_ARCH "s390x")
+elseif ("${HOST_ARCH}" STREQUAL "ppc64le")
+  set(VCPKG_HOST_ARCH "ppc64le")
 else()
   set(VCPKG_HOST_ARCH "x64")
 endif()
@@ -51,9 +55,17 @@ else()
   set(VCPKG_HOST_OS "linux")
 endif()
 
-# Use ccache if it's installed
+# Use caching option if it's installed
+find_program(SCCACHE_PROGRAM sccache)
 find_program(CCACHE_PROGRAM ccache)
-if(CCACHE_PROGRAM)
+if(SCCACHE_PROGRAM)
+  set(CMAKE_CXX_COMPILER_LAUNCHER "${SCCACHE_PROGRAM}")
+  set(CMAKE_C_COMPILER_LAUNCHER "${SCCACHE_PROGRAM}")
+  if("${HOST_OS_NAME}" STREQUAL "Windows")
+    set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT "$<$<CONFIG:Debug,RelWithDebInfo>:Embedded>")
+    cmake_policy(SET CMP0141 NEW)
+  endif()
+elseif(CCACHE_PROGRAM)
   set(CMAKE_CXX_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
   set(CMAKE_C_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
 endif()
@@ -92,7 +104,17 @@ else ()
   string(APPEND VCPKG_CMD "sh")
 endif ()
 
-execute_process(COMMAND ${VCPKG_CMD} RESULT_VARIABLE VCPKG_BOOTSTRAP_RESULT)
+# GCC is unreliable on ppc64le and can cause internal compiler errors during vcpkg bootstrap
+set(VCPKG_BOOTSTRAP_ENV)
+if(${VCPKG_HOST_ARCH} STREQUAL "ppc64le")
+  set(VCPKG_BOOTSTRAP_ENV
+    "CC=clang"
+    "CXX=clang++"
+    "CMAKE_C_COMPILER=clang"
+    "CMAKE_CXX_COMPILER=clang++")
+endif()
+
+execute_process(COMMAND ${CMAKE_COMMAND} -E env ${VCPKG_BOOTSTRAP_ENV} ${VCPKG_CMD} RESULT_VARIABLE VCPKG_BOOTSTRAP_RESULT)
 
 if(NOT VCPKG_BOOTSTRAP_RESULT EQUAL 0)
   message(FATAL_ERROR "Bootstrapping vcpkg failed with exit code: ${VCPKG_BOOTSTRAP_RESULT}")
@@ -108,6 +130,14 @@ set(CMAKE_TOOLCHAIN_FILE "${MULTIPASS_VCPKG_LOCATION}/scripts/buildsystems/vcpkg
   CACHE STRING "Vcpkg toolchain file")
 
 project(Multipass)
+
+cmake_dependent_option(
+    MULTIPASS_ENABLE_FLUTTER_GUI
+    "Build Flutter GUI"
+    ON
+    "NOT (CMAKE_SYSTEM_PROCESSOR STREQUAL s390x OR CMAKE_SYSTEM_PROCESSOR STREQUAL ppc64le)"
+    OFF
+)
 
 include(GNUInstallDirs)
 
@@ -181,11 +211,19 @@ if(UNIX)
     set(HOST_ARCH "aarch64")
   endif ()
 
+  if (${HOST_ARCH} STREQUAL "ppc64le")
+    set(HOST_ARCH "ppc64")
+  endif ()
+
   if (FORCE_ENABLE_VIRTUALBOX OR (APPLE AND ${HOST_ARCH} MATCHES "x86_64"))
       list(APPEND MULTIPASS_BACKENDS virtualbox)
   endif()
 
   list(APPEND MULTIPASS_BACKENDS qemu)
+
+  if(APPLEVZ_ENABLED)
+    list(APPEND MULTIPASS_BACKENDS applevz)
+  endif()
 endif()
 
 # Boost config
@@ -221,109 +259,7 @@ add_subdirectory(3rd-party)
 # Qt config
 find_package(Qt6 COMPONENTS Core Concurrent Network REQUIRED)
 
-function(determine_version OUTPUT_VARIABLE)
-  # use upstream repo as the authoritative reference when checking for release status
-  # set -DMULTIPASS_UPSTREAM="" to use the local repository
-  if(MULTIPASS_UPSTREAM)
-    set(MULTIPASS_UPSTREAM "${MULTIPASS_UPSTREAM}/")
-  endif()
-
-  execute_process(COMMAND git describe --all --exact --match "${MULTIPASS_UPSTREAM}release/*"
-                  WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-                  OUTPUT_VARIABLE GIT_RELEASE_BRANCH
-                  OUTPUT_STRIP_TRAILING_WHITESPACE
-                  ERROR_QUIET)
-
-  execute_process(COMMAND git describe --long --abbrev=8
-                  WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-                  OUTPUT_VARIABLE GIT_VERSION
-                  OUTPUT_STRIP_TRAILING_WHITESPACE)
-
-  # only use -rc tags on release/* branches
-  string(REGEX MATCH "release/[0-9]+.[0-9]+" GIT_RELEASE_MATCH "${GIT_RELEASE_BRANCH}")
-  if(GIT_RELEASE_MATCH)
-      if(NOT DEFINED MULTIPASS_UPSTREAM)
-        message(FATAL_ERROR "You need to set MULTIPASS_UPSTREAM for a release build.\
-                             \nUse an empty string to make local the authoritative repository.")
-      endif()
-
-      execute_process(COMMAND git describe --exact
-                      WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-                      OUTPUT_VARIABLE GIT_RELEASE
-                      OUTPUT_STRIP_TRAILING_WHITESPACE
-                      ERROR_QUIET)
-
-      execute_process(COMMAND git describe --tags --match *-rc[0-9]* --abbrev=0
-                      WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-                      OUTPUT_VARIABLE GIT_TAG
-                      OUTPUT_STRIP_TRAILING_WHITESPACE)
-  else()
-      execute_process(COMMAND git describe --tags --match *-dev --abbrev=0
-                      WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-                      OUTPUT_VARIABLE GIT_TAG
-                      OUTPUT_STRIP_TRAILING_WHITESPACE)
-  endif()
-
-  string(REGEX MATCH "^v.+-([0-9]+)-(g.+)$" GIT_VERSION_MATCH ${GIT_VERSION})
-
-  if(GIT_RELEASE)
-    set(NEW_VERSION ${GIT_RELEASE})
-  elseif(GIT_VERSION_MATCH AND MULTIPASS_BUILD_LABEL)
-    set(NEW_VERSION ${GIT_TAG}.${CMAKE_MATCH_1}.${MULTIPASS_BUILD_LABEL}+${CMAKE_MATCH_2})
-  elseif(GIT_VERSION_MATCH)
-    set(NEW_VERSION ${GIT_TAG}.${CMAKE_MATCH_1}+${CMAKE_MATCH_2})
-  else()
-    message(FATAL_ERROR "Failed to parse version number: ${GIT_VERSION}")
-  endif()
-
-  # assert that the output of `git describe` does not include "full" any longer (after merger)
-  string(FIND "${NEW_VERSION}" "full" FULL_POSITION)
-  if(FULL_POSITION GREATER_EQUAL 0)
-      message(FATAL_ERROR "Version string should not contain 'full': ${NEW_VERSION}")
-  endif()
-
-  if(APPLE OR WIN32)
-    set(VERSION_SEPARATOR "+")
-    string(FIND "${NEW_VERSION}" "+" PLUS_POSITION)
-    if(PLUS_POSITION GREATER_EQUAL 0)
-      set(VERSION_SEPARATOR ".")
-    endif()
-
-    if(APPLE)
-      string(APPEND NEW_VERSION "${VERSION_SEPARATOR}mac")
-    else()
-      string(APPEND NEW_VERSION "${VERSION_SEPARATOR}win")
-    endif()
-  endif()
-
-  string(REGEX MATCH "^v(.+)" VERSION_MATCH ${NEW_VERSION})
-
-  if(VERSION_MATCH)
-    set(${OUTPUT_VARIABLE} ${CMAKE_MATCH_1} PARENT_SCOPE)
-  else()
-    message(FATAL_ERROR "Invalid tag detected: ${NEW_VERSION}")
-  endif()
-endfunction()
-
-function(determine_version_components VERSION_STRING SEMANTIC_VERSION BUILD_NUMBER)
-  # stuff before + is the version and after the + is the build metadata
-  string(FIND "${VERSION_STRING}" "+" PLUS_POS)
-  string(SUBSTRING "${VERSION_STRING}" 0 ${PLUS_POS} MULTIPASS_SEMANTIC_VERSION)
-  if (PLUS_POS GREATER -1)
-      string(SUBSTRING "${VERSION_STRING}" ${PLUS_POS} -1 MULTIPASS_BUILD_STRING)
-      # if the build metadata starts with a g, the hexadecimal chars after that are a commit hash
-      # otherwise, we do not derive any build string
-      string(REGEX MATCH "^[+]g([a-f0-9]+)" "" "${MULTIPASS_BUILD_STRING}")
-      set(BUILD_NUMBER_HEX ${CMAKE_MATCH_1})
-  endif()
-  # convert the hexadecimal commit hash to decimal. if none was extracted, this defaults to 0
-  # we need it to be decimal because flutter --build-number accepts only decimal chars
-  math(EXPR MULTIPASS_BUILD_NUMBER "0x0${BUILD_NUMBER_HEX}")
-
-  set(${SEMANTIC_VERSION} ${MULTIPASS_SEMANTIC_VERSION} PARENT_SCOPE)
-  set(${BUILD_NUMBER} ${MULTIPASS_BUILD_NUMBER} PARENT_SCOPE)
-endfunction()
-
+include(src/cmake/versioning.cmake)
 determine_version(MULTIPASS_VERSION)
 set(MULTIPASS_VERSION ${MULTIPASS_VERSION})
 message(STATUS "Setting version to: ${MULTIPASS_VERSION}")
@@ -424,7 +360,7 @@ add_subdirectory(src)
 
 if(MULTIPASS_ENABLE_TESTS)
   enable_testing()
-  add_subdirectory(tests)
+  add_subdirectory(tests/unit)
 endif()
 
 include(packaging/cpack.cmake OPTIONAL)

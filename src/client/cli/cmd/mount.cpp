@@ -26,6 +26,7 @@
 #include <multipass/exceptions/cmd_exceptions.h>
 #include <multipass/format.h>
 #include <multipass/logging/log.h>
+#include <multipass/logging/log_location.h>
 
 #include <QDir>
 #include <QFileInfo>
@@ -69,7 +70,7 @@ auto checked_mount_type(const QString& type)
 }
 } // namespace
 
-mp::ReturnCode cmd::Mount::run(mp::ArgParser* parser)
+mp::ReturnCodeVariant cmd::Mount::run(mp::ArgParser* parser)
 {
     auto ret = parse_args(parser);
     if (ret != ParseCode::Ok)
@@ -79,12 +80,12 @@ mp::ReturnCode cmd::Mount::run(mp::ArgParser* parser)
 
     mp::AnimatedSpinner spinner{cout};
 
-    auto on_success = [&spinner](mp::MountReply& reply) {
+    auto on_success = [&spinner](mp::MountReply& reply) -> ReturnCodeVariant {
         spinner.stop();
         return ReturnCode::Ok;
     };
 
-    auto on_failure = [this, &spinner](grpc::Status& status) {
+    auto on_failure = [this, &spinner](grpc::Status& status) -> ReturnCodeVariant {
         spinner.stop();
         return standard_failure_handler_for(name(), cerr, status);
     };
@@ -233,11 +234,7 @@ mp::ParseCode cmd::Mount::parse_args(mp::ArgParser* parser)
     }
     else
     {
-        mpl::debug(category,
-                   "{}:{} {}(): adding default uid mapping",
-                   __FILE__,
-                   __LINE__,
-                   __FUNCTION__);
+        mpl::debug_location(category, "adding default uid mapping");
 
         auto uid_pair = mount_maps->add_uid_mappings();
         uid_pair->set_host_id(mcp::getuid());
@@ -276,11 +273,7 @@ mp::ParseCode cmd::Mount::parse_args(mp::ArgParser* parser)
     }
     else
     {
-        mpl::debug(category,
-                   "{}:{} {}(): adding default gid mapping",
-                   __FILE__,
-                   __LINE__,
-                   __FUNCTION__);
+        mpl::debug_location(category, "adding default gid mapping");
 
         auto gid_pair = mount_maps->add_gid_mappings();
         gid_pair->set_host_id(mcp::getgid());
